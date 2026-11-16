@@ -1,0 +1,16 @@
+# Core (needed even in mock/demo mode)
+requests>=2.31
+pydantic>=2.6        # typed contracts between agents (src/schemas.py)
+python-dotenv>=1.0   # loads .env configuration
+
+# Live mode — enrichment (website scrape / search)
+beautifulsoup4>=4.12
+langgraph>=0.2
+langchain-core>=0.3
+# one search provider, pick one:
+#   google-search-results   # SerpAPI
+#   tavily-python
+
+# Live mode — Google Sheets backend (CsvSheetStore needs none of this)
+gspread>=6.0
+google-auth>=2.30

@@ -1,0 +1,244 @@
+{
+  "name": "GoPratle BDR Lead Enrichment & Outreach Agent",
+  "meta": {
+    "note": "Reference scaffold, not a plug-and-play import. After importing: (1) attach your Google Sheets + Telegram credentials, (2) point the two HTTP Request nodes at your enrichment API of choice (SerpAPI/Tavily/Apollo), (3) point the two LLM nodes at Anthropic/OpenAI credentials. Mirrors src/orchestrator.py stage-for-stage so the Python version and this version stay in sync conceptually."
+  },
+  "nodes": [
+    {
+      "parameters": { "pollTimes": { "item": [{ "mode": "everyMinute" }] }, "sheetId": "={{$env.GOOGLE_SHEET_ID}}", "range": "Leads!A:A", "event": "rowAdded" },
+      "name": "Trigger: New Sheet Row",
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [-200, 0]
+    },
+    {
+      "parameters": { "updates": ["message"] },
+      "name": "Trigger: Telegram Command",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1,
+      "position": [-200, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Cheap regex-first intent parse — mirrors src/intent_parser.py.\nconst text = $json.message?.text || '';\nconst m = text.match(/for\\s+(.+?)\\s+in\\s+([A-Za-z .]+)/i);\nreturn [{ json: { company: m ? m[1].trim() : '', city: m ? m[2].trim() : '', source: 'telegram', chat_id: $json.message?.chat?.id } }];"
+      },
+      "name": "Parse Telegram Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [20, 220]
+    },
+    {
+      "parameters": {},
+      "name": "Merge Trigger Surfaces",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [260, 110]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Security checkpoint (mirrors src/security.py) — runs BEFORE any paid lookup or LLM call.\n// 1) domain blacklist (OWASP LLM08 'Excessive Agency' mitigation — never auto-act on a blocked target)\n// 2) cooldown/idempotency: skip if this company+city was already SENT within COOLDOWN_DAYS\nconst BLOCKED_DOMAINS = ['gopratle.com'];\nconst COOLDOWN_DAYS = 7;\nconst company = $json.company || '';\nconst domain = (company.toLowerCase().replace(/\\s+/g, '') + '.com');\nif (BLOCKED_DOMAINS.includes(domain)) {\n  return [{ json: { ...$json, blocked: true, reason: `${domain} is on the do-not-contact list` } }];\n}\n// Cooldown check needs a read of the Sheet's existing rows for this company — wire a\n// Google Sheets 'lookup' node before this one in production; left as a pass-through here.\nreturn [{ json: { ...$json, blocked: false } }];"
+      },
+      "name": "Security Checkpoint",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [380, 110]
+    },
+    {
+      "parameters": { "conditions": { "boolean": [{ "value1": "={{$json.blocked}}", "value2": true }] } },
+      "name": "IF: Blocked?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [500, 0]
+    },
+    {
+      "parameters": {
+        "url": "https://api.serpapi.com/search",
+        "method": "GET",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "q", "value": "=site:linkedin.com \"{{$json.company}}\" (\"Founder\" OR \"Head of Events\" OR \"HR\") \"{{$json.city}}\"" },
+          { "name": "api_key", "value": "={{$env.SERPAPI_KEY}}" }
+        ] }
+      },
+      "name": "Enrich: Search Dork (waterfall stage 1)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [500, 110]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Waterfall gate — mirrors src/enrichment.py run_waterfall().\n// Only fall through to a paid provider if stage 1 came back empty/low-confidence.\nconst hit = $json.organic_results && $json.organic_results.length > 0;\nreturn [{ json: { ...$('Merge Trigger Surfaces').item.json, found: hit, raw: hit ? $json.organic_results[0] : null } }];"
+      },
+      "name": "Waterfall Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [740, 110]
+    },
+    {
+      "parameters": { "conditions": { "boolean": [{ "value1": "={{$json.found}}", "value2": false }] } },
+      "name": "IF: Needs Paid Enrichment?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [980, 110]
+    },
+    {
+      "parameters": {
+        "url": "https://api.apollo.io/v1/people/match",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "X-Api-Key", "value": "={{$env.APOLLO_API_KEY}}" }] },
+        "sendBody": true,
+        "bodyParameters": { "parameters": [{ "name": "organization_name", "value": "={{$json.company}}" }] }
+      },
+      "name": "Enrich: Paid People API (waterfall stage 2, cost-gated)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1220, 40]
+    },
+    {
+      "parameters": {
+        "modelId": "claude-sonnet-4-6",
+        "messages": { "values": [
+          { "role": "system", "content": "You classify a job title into: Founder/Leadership, HR/People, Events/Marketing, Other." },
+          { "role": "user", "content": "={{$json.raw?.title || ''}}" }
+        ] }
+      },
+      "name": "Score: Classify Role (LLM)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1,
+      "position": [1220, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Explainable fit score — mirrors src/scoring.py score_fit().\nlet score = 40;\nif ($json.raw?.title) score += 20;\nif ($json.email) score += 10;\nreturn [{ json: { ...$json, fit_score: Math.min(score, 100) } }];"
+      },
+      "name": "Score: Fit Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1460, 180]
+    },
+    {
+      "parameters": {
+        "modelId": "claude-sonnet-4-6",
+        "messages": { "values": [
+          { "role": "system", "content": "You are a BDR pitch writer for GoPratle (connects event hosts with vetted planners, DJs, crew). Write EXACTLY 3 lines: warm specific opener, role-angled value prop, low-friction CTA." },
+          { "role": "user", "content": "=Company: {{$json.company}}\nCity: {{$json.city}}\nRole: {{$json.role_category}}" }
+        ] }
+      },
+      "name": "Pitch: Producer (draft)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1,
+      "position": [1700, 180]
+    },
+    {
+      "parameters": {
+        "modelId": "claude-sonnet-4-6",
+        "messages": { "values": [
+          { "role": "system", "content": "You are an independent reviewer (not the writer). Return ONLY JSON {issues:[...], ready_to_ship: bool}. Flag wrong line count, over-promising, missing company/brand name." },
+          { "role": "user", "content": "=Pitch:\n{{$json.pitch_draft}}" }
+        ] }
+      },
+      "name": "Critic: Reflexion Check",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1,
+      "position": [1940, 180]
+    },
+    {
+      "parameters": { "conditions": { "boolean": [{ "value1": "={{$json.ready_to_ship}}", "value2": false }] } },
+      "name": "IF: Needs Revision? (max 2 rounds)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2180, 180]
+    },
+    {
+      "parameters": { "range": "Leads!A:R", "operation": "appendOrUpdate", "sheetId": "={{$env.GOOGLE_SHEET_ID}}" },
+      "name": "Write Lead + Pitch to Sheet (status = PENDING_APPROVAL)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2420, 260]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$json.chat_id}}",
+        "text": "=Lead: {{$json.company}} ({{$json.city}})\nPitch:\n{{$json.pitch_final}}\n\nApprove to send?",
+        "additionalFields": { "reply_markup": { "inline_keyboard": [[{ "text": "Approve", "callback_data": "approve" }, { "text": "Reject", "callback_data": "reject" }]] } }
+      },
+      "name": "Human Approval Gate (Telegram inline buttons)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [2660, 260]
+    },
+    {
+      "parameters": { "conditions": { "string": [{ "value1": "={{$json.callback_data}}", "value2": "approve" }] } },
+      "name": "IF: Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2900, 260]
+    },
+    {
+      "parameters": { "chatId": "={{$json.chat_id}}", "text": "={{$json.pitch_final}}" },
+      "name": "Send Outreach (sandbox bot)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [3140, 180]
+    },
+    {
+      "parameters": { "amount": 3, "unit": "days" },
+      "name": "Wait: Follow-up Timer",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [3380, 180]
+    },
+    {
+      "parameters": { "range": "Leads!A:R", "operation": "appendOrUpdate", "sheetId": "={{$env.GOOGLE_SHEET_ID}}" },
+      "name": "Update Sheet (status = FOLLOWUP_DUE)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [3620, 180]
+    }
+  ],
+  "connections": {
+    "Trigger: New Sheet Row": { "main": [[{ "node": "Merge Trigger Surfaces", "type": "main", "index": 0 }]] },
+    "Trigger: Telegram Command": { "main": [[{ "node": "Parse Telegram Command", "type": "main", "index": 0 }]] },
+    "Parse Telegram Command": { "main": [[{ "node": "Merge Trigger Surfaces", "type": "main", "index": 1 }]] },
+    "Merge Trigger Surfaces": { "main": [[{ "node": "Security Checkpoint", "type": "main", "index": 0 }]] },
+    "Security Checkpoint": { "main": [[{ "node": "IF: Blocked?", "type": "main", "index": 0 }]] },
+    "IF: Blocked?": {
+      "main": [
+        [],
+        [{ "node": "Enrich: Search Dork (waterfall stage 1)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Enrich: Search Dork (waterfall stage 1)": { "main": [[{ "node": "Waterfall Gate", "type": "main", "index": 0 }]] },
+    "Waterfall Gate": { "main": [[{ "node": "IF: Needs Paid Enrichment?", "type": "main", "index": 0 }]] },
+    "IF: Needs Paid Enrichment?": {
+      "main": [
+        [{ "node": "Enrich: Paid People API (waterfall stage 2, cost-gated)", "type": "main", "index": 0 }],
+        [{ "node": "Score: Classify Role (LLM)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Enrich: Paid People API (waterfall stage 2, cost-gated)": { "main": [[{ "node": "Score: Classify Role (LLM)", "type": "main", "index": 0 }]] },
+    "Score: Classify Role (LLM)": { "main": [[{ "node": "Score: Fit Score", "type": "main", "index": 0 }]] },
+    "Score: Fit Score": { "main": [[{ "node": "Pitch: Producer (draft)", "type": "main", "index": 0 }]] },
+    "Pitch: Producer (draft)": { "main": [[{ "node": "Critic: Reflexion Check", "type": "main", "index": 0 }]] },
+    "Critic: Reflexion Check": { "main": [[{ "node": "IF: Needs Revision? (max 2 rounds)", "type": "main", "index": 0 }]] },
+    "IF: Needs Revision? (max 2 rounds)": {
+      "main": [
+        [{ "node": "Pitch: Producer (draft)", "type": "main", "index": 0 }],
+        [{ "node": "Write Lead + Pitch to Sheet (status = PENDING_APPROVAL)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Write Lead + Pitch to Sheet (status = PENDING_APPROVAL)": { "main": [[{ "node": "Human Approval Gate (Telegram inline buttons)", "type": "main", "index": 0 }]] },
+    "Human Approval Gate (Telegram inline buttons)": { "main": [[{ "node": "IF: Approved?", "type": "main", "index": 0 }]] },
+    "IF: Approved?": {
+      "main": [
+        [{ "node": "Send Outreach (sandbox bot)", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Send Outreach (sandbox bot)": { "main": [[{ "node": "Wait: Follow-up Timer", "type": "main", "index": 0 }]] },
+    "Wait: Follow-up Timer": { "main": [[{ "node": "Update Sheet (status = FOLLOWUP_DUE)", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": {}
+}
